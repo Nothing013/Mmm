@@ -114,11 +114,12 @@ class DashDazzTileService : TileService() {
     private fun describeState(state: DashDazzState): String {
         if (!state.isRunning) return getString(R.string.status_service_stopped)
         if (state.isScreenPaused) return getString(R.string.notification_paused)
-        val mode = when (state.mode) {
+        val mode = if (state.chargingIndicator) {
+            getString(R.string.mode_charging)
+        } else when (state.mode) {
             DashDazzService.MODE_BREATHE -> getString(R.string.mode_breathe)
             DashDazzService.MODE_SOLID -> getString(R.string.mode_solid)
             DashDazzService.MODE_DUAL -> getString(R.string.mode_dual)
-            DashDazzService.MODE_CHARGING -> getString(R.string.mode_charging)
             else -> getString(R.string.mode_rainbow)
         }
         val detail = if (state.mode == DashDazzService.MODE_DUAL) {

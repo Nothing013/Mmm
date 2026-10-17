@@ -901,7 +901,6 @@ fun DashDazzScreen(
                                         add(DashDazzService.MODE_BREATHE to R.string.mode_breathe)
                                     }
                                     add(DashDazzService.MODE_SOLID to R.string.mode_solid)
-                                    add(DashDazzService.MODE_CHARGING to R.string.mode_charging)
                                     if (isRootAvailable) {
                                         add(DashDazzService.MODE_DUAL to R.string.mode_dual)
                                     }
@@ -1580,7 +1579,7 @@ fun DashDazzScreen(
                                 Spacer(modifier = Modifier.height(12.dp))
 
                                 val isColorGone = serviceState.mode == DashDazzService.MODE_RAINBOW ||
-                                        serviceState.mode == DashDazzService.MODE_CHARGING ||
+                                        serviceState.chargingIndicator ||
                                         (serviceState.mode == DashDazzService.MODE_DUAL &&
                                         (!isRootAvailable ||
                                         (serviceState.dualStyle != DashDazzService.DUAL_HARDWARE_SPLIT &&
@@ -1692,7 +1691,7 @@ fun DashDazzScreen(
 
                     if (serviceState.mode != DashDazzService.MODE_DUAL &&
                         serviceState.mode != DashDazzService.MODE_RAINBOW &&
-                        serviceState.mode != DashDazzService.MODE_CHARGING) {
+                        !serviceState.chargingIndicator) {
                         Card(modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
                                 Text(

@@ -14,8 +14,8 @@
     <string name="survival_failed">Could not apply protection</string>
     <string name="flash_screen_title">Flash on lock and unlock</string>
     <string name="flash_screen_desc">Pulse the ring when the screen turns off and on</string>
-    <string name="auto_charging_title">Auto charging light</string>
-    <string name="auto_charging_desc">Switch to the Charging light while plugged in</string>
+    <string name="auto_charging_title">Charging light</string>
+    <string name="auto_charging_desc">While plugged in, show battery level on the ring instead of your mode</string>
     <string name="notif_app_custom">Custom</string>
     <string name="notif_app_default">Default</string>
     <string name="notif_app_reset">Reset</string>
@@ -36,7 +36,7 @@
     <string name="mode_breathe">Breathe</string>
     <string name="mode_solid">Solid</string>
     <string name="mode_dual">Dual Ring</string>
-    <string name="mode_charging">Charging</string>
+    <string name="mode_charging">Charging light</string>
 
     <string name="title_dual_effects">Dual-Ring Effects</string>
     <string name="dual_hardware_split">Hardware Split</string>

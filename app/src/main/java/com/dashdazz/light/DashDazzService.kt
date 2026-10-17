@@ -51,6 +51,7 @@ data class DashDazzState(
     val notifActivateDuration: Int = 5,
 
     val audioReactive: Boolean = false,
+    val chargingIndicator: Boolean = false,
 
     val frameMinMs: Long = 20L
 )
@@ -82,6 +83,7 @@ class DashDazzService : Service() {
         const val EXTRA_DUO_HUE_OFFSET = "extra_duo_hue_offset"
         const val EXTRA_NOTIF_MODE = "extra_notif_mode"
         const val EXTRA_NOTIF_ACTIVATE_DURATION = "extra_notif_activate_duration"
+        const val EXTRA_CHARGING_INDICATOR = "extra_charging_indicator"
         const val EXTRA_ACTIVATE_DURATION = "extra_activate_duration"
         const val EXTRA_FORCE = "extra_force"
 
@@ -92,11 +94,13 @@ class DashDazzService : Service() {
 
         const val MODE_AUDIO_REACTIVE = 4
 
-        const val MODE_CHARGING = 5
-
         const val SCREEN_ON_ONLY = 0
         const val SCREEN_OFF_ONLY = 1
         const val SCREEN_ALWAYS = 2
+
+        private const val CHARGING_BREATH_PERIOD_MS = 6000f
+        private const val CHARGING_UNKNOWN_HUE = 45f
+        private const val LEGACY_MODE_CHARGING = 5
         const val SCREEN_NOTIF_ONLY = 3
 
         const val DUAL_HARDWARE_SPLIT = 0
@@ -156,7 +160,7 @@ class DashDazzService : Service() {
             if (svc == null) {
                 if (connected) {
                     Log.d(TAG, "Power connected: starting charging light from idle")
-                    start(context, mode = MODE_CHARGING)
+                    start(context, chargingIndicator = true)
                 }
                 return
             }
@@ -182,12 +186,14 @@ class DashDazzService : Service() {
             spinColorB: Int? = null,
             duoHueOffset: Int? = null,
             notifMode: Int? = null,
-            notifActivateDuration: Int? = null
+            notifActivateDuration: Int? = null,
+            chargingIndicator: Boolean? = null
         ) {
 
             val s = _stateFlow.value
             val intent = Intent(context, DashDazzService::class.java).apply {
                 action = ACTION_START
+                putExtra(EXTRA_CHARGING_INDICATOR, chargingIndicator ?: s.chargingIndicator)
                 putExtra(EXTRA_MODE, mode ?: s.mode)
                 putExtra(EXTRA_COLOR, color ?: s.color)
                 putExtra(EXTRA_SPEED_MS, speedMs ?: s.speedMs)
@@ -311,6 +317,9 @@ class DashDazzService : Service() {
             val target = activeService
             if (modeChanged) {
                 target?.let { if (it.autoChargeActive) it.autoChargeActive = false }
+                if (current.chargingIndicator) {
+                    _stateFlow.update { it.copy(chargingIndicator = false) }
+                }
             }
             if (target == null && current.isRunning) {
 
@@ -358,6 +367,11 @@ class DashDazzService : Service() {
 
             if (Prefs.getDualStyle(context, -1) == DUAL_FIRE_ICE_LEGACY) {
                 Prefs.setDualStyle(context, DUAL_ALTERNATE)
+            }
+
+            if (Prefs.getMode(context) == LEGACY_MODE_CHARGING) {
+                Log.d(TAG, "Migrating legacy charging mode back to rainbow")
+                Prefs.setMode(context, MODE_RAINBOW)
             }
 
             val saved = Prefs.loadState(context)
@@ -487,7 +501,6 @@ class DashDazzService : Service() {
     private var lastActivateDurationSec = 5
     @Volatile
     private var autoChargeActive = false
-    private var autoChargeFromMode = MODE_RAINBOW
     private var autoChargeStartedService = false
     private var job: Job? = null
     private var pulseJob: Job? = null
@@ -585,6 +598,7 @@ class DashDazzService : Service() {
 
                 val s = _stateFlow.value
                 val newMode = intent.getIntExtra(EXTRA_MODE, s.mode)
+                val newCharging = intent.getBooleanExtra(EXTRA_CHARGING_INDICATOR, s.chargingIndicator)
                 val newColor = intent.getIntExtra(EXTRA_COLOR, s.color)
                 val newSpeed = intent.getLongExtra(EXTRA_SPEED_MS, s.speedMs).coerceIn(10L, 500L)
                 val newBrightness = intent.getFloatExtra(EXTRA_BRIGHTNESS, s.brightness)
@@ -622,6 +636,7 @@ class DashDazzService : Service() {
                     it.copy(
                         isRunning = true,
                         isScreenPaused = false,
+                        chargingIndicator = newCharging,
                         mode = newMode,
                         color = newColor,
                         speedMs = newSpeed,
@@ -646,7 +661,7 @@ class DashDazzService : Service() {
                     runCatching { LightsBridge.ensureBackgroundSurvival(packageName) }
                 }
 
-                if (autoChargeActive && newMode == MODE_CHARGING) {
+                if (newCharging) {
                     launchAnimationLoopBypassScreenCheck()
                 } else if (newScreenMode == SCREEN_NOTIF_ONLY) {
 
@@ -803,12 +818,15 @@ class DashDazzService : Service() {
             LightsBridge.resetHardwareToGlobal()
         }
         LightsBridge.resetScene()
+        if (_stateFlow.value.chargingIndicator) {
+            runChargingLoop()
+            return
+        }
         when (mode) {
             MODE_RAINBOW -> runRainbowLoop()
             MODE_BREATHE -> runBreatheLoop()
             MODE_SOLID -> runSolidLoop()
             MODE_DUAL -> runDualLoop()
-            MODE_CHARGING -> runChargingLoop()
             else -> runRainbowLoop()
         }
     }
@@ -1087,25 +1105,45 @@ class DashDazzService : Service() {
         }
     }
 
-    private suspend fun CoroutineScope.runChargingLoop() {
+    private fun batteryPercent(): Int {
         val bm = getSystemService(BatteryManager::class.java)
+        val prop = runCatching { bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) }
+            .getOrNull()
+        if (prop != null && prop in 1..100) return prop
+        val sticky = runCatching {
+            registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        }.getOrNull()
+        val level = sticky?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = sticky?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+        if (level >= 0 && scale > 0) return ((level * 100f) / scale).toInt().coerceIn(0, 100)
+        return -1
+    }
+
+    private suspend fun CoroutineScope.runChargingLoop() {
         var lastColor: Int? = null
-        var phase = 0f
+        var lastPhase = 0f
+        var lastLevel = -2
         while (isActive) {
             ensureActive()
             val state = _stateFlow.value
             val userBright = state.brightness.coerceIn(0.05f, 1f)
-            val level = (bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1)
-                .coerceIn(0, 100)
-            val hue = level * 1.2f
-            phase = (phase + 1f) % 360f
-            val breathe = 0.55f + 0.45f * sin(Math.toRadians(phase.toDouble())).toFloat()
-            val targetColor = hsv(hue, 1f, (breathe * userBright).coerceIn(0.05f, 1f))
+            val level = batteryPercent()
+            if (level != lastLevel) {
+                lastLevel = level
+                Log.d(TAG, "Charging indicator level=$level")
+            }
+            val hue = if (level >= 0) level * 1.2f else CHARGING_UNKNOWN_HUE
+            val stepMs = govDelay(state.speedMs.coerceIn(10L, 500L))
+            val phaseStep = 360f * (stepMs / CHARGING_BREATH_PERIOD_MS)
+            lastPhase = (lastPhase + phaseStep) % 360f
+            val breathe = 0.65f + 0.35f *
+                sin(Math.toRadians(lastPhase.toDouble())).toFloat()
+            val targetColor = hsv(hue, 1f, (breathe * userBright).coerceIn(0.15f, 1f))
             if (targetColor != lastColor) {
                 lastColor = targetColor
                 LightsBridge.setCameraRing(targetColor)
             }
-            delay(govDelay(state.speedMs.coerceIn(10L, 500L)))
+            delay(stepMs)
         }
     }
 
@@ -1507,37 +1545,39 @@ class DashDazzService : Service() {
     }
 
     internal fun enterChargingMode() {
+        if (autoChargeActive) return
         val s = _stateFlow.value
-        autoChargeFromMode = s.mode
         autoChargeStartedService = !s.isRunning
-        if (s.isRunning) {
-            updateSettings(this, mode = MODE_CHARGING)
-            launchAnimationLoopBypassScreenCheck()
-        } else {
-            autoChargeActive = true
-            start(this, mode = MODE_CHARGING)
-            return
-        }
         autoChargeActive = true
+        if (s.isRunning) {
+            _stateFlow.update { it.copy(chargingIndicator = true, isScreenPaused = false) }
+            launchAnimationLoopBypassScreenCheck()
+            updateNotificationText()
+            notifyTileState(this)
+        } else {
+            start(this, chargingIndicator = true)
+        }
     }
 
     internal fun exitChargingMode() {
-        if (!autoChargeActive) {
+        val startedByUs = autoChargeStartedService
+        autoChargeStartedService = false
+        val wasActive = autoChargeActive
+        autoChargeActive = false
+        if (!wasActive) {
             if (stillRunning() && shouldRunNow()) {
                 Log.d(TAG, "Power disconnected: taking the ring back once")
                 launchAnimationLoop()
             }
             return
         }
-        autoChargeActive = false
-        if (autoChargeStartedService && _stateFlow.value.mode == MODE_CHARGING) {
-            autoChargeStartedService = false
+        _stateFlow.update { it.copy(chargingIndicator = false) }
+        if (startedByUs) {
+            Log.d(TAG, "Charging indicator ended: stopping the light we started")
             stopLight()
-        } else if (_stateFlow.value.mode == MODE_CHARGING) {
-            autoChargeStartedService = false
-            updateSettings(this, mode = autoChargeFromMode)
         } else {
-            autoChargeStartedService = false
+            Log.d(TAG, "Charging indicator ended: restoring the configured mode")
+            evaluateScreenPolicy()
         }
     }
 
@@ -1643,12 +1683,13 @@ class DashDazzService : Service() {
         )
 
         val state = _stateFlow.value
-        val modeName = when (state.mode) {
+        val modeName = if (state.chargingIndicator) {
+            getString(R.string.mode_charging)
+        } else when (state.mode) {
             MODE_RAINBOW -> getString(R.string.mode_rainbow)
             MODE_BREATHE -> getString(R.string.mode_breathe)
             MODE_SOLID -> getString(R.string.mode_solid)
             MODE_DUAL -> getString(R.string.mode_dual)
-            MODE_CHARGING -> getString(R.string.mode_charging)
             else -> getString(R.string.mode_rainbow)
         }
 
