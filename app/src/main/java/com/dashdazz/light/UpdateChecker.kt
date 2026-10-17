@@ -9,6 +9,8 @@ import android.provider.Settings
 import android.util.Log
 import androidx.core.content.FileProvider
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
@@ -40,9 +42,9 @@ object UpdateChecker {
         return never || System.currentTimeMillis() - last >= AUTO_CHECK_INTERVAL_MS
     }
 
-    suspend fun check(context: Context): UpdateStatus {
+    suspend fun check(context: Context): UpdateStatus = withContext(Dispatchers.IO) {
         Prefs.setUpdateLastCheckMs(context, System.currentTimeMillis())
-        return try {
+        try {
             val conn = URL(API_LATEST).openConnection() as HttpURLConnection
             var status: UpdateStatus
             try {
@@ -77,12 +79,12 @@ object UpdateChecker {
             }
             status
         } catch (e: Throwable) {
-            Log.d(TAG, "Update check failed: ${e.javaClass.simpleName}")
+            Log.d(TAG, "Update check failed: ${e.javaClass.simpleName}: ${e.message}")
             UpdateStatus.Failed("network")
         }
     }
 
-    private fun versionCodeFromTag(tag: String): Int? {
+    internal fun versionCodeFromTag(tag: String): Int? {
         val cleaned = tag.trim().removePrefix("v")
         val parts = cleaned.split(".")
         if (parts.size < 2) return null
@@ -103,21 +105,25 @@ object UpdateChecker {
         }
     }
 
-    suspend fun download(context: Context, tag: String, onProgress: (Int) -> Unit): Result<File> {
+    suspend fun download(
+        context: Context,
+        tag: String,
+        onProgress: (Int) -> Unit
+    ): Result<File> = withContext(Dispatchers.IO) {
         val target = downloadTarget(context, tag)
         val temp = File(target.parentFile, target.name + ".part")
-        return try {
+        try {
             val conn = URL("$DOWNLOAD_URL/$tag/$ASSET_NAME").openConnection() as HttpURLConnection
             try {
                 conn.connectTimeout = CONNECT_TIMEOUT_MS
                 conn.readTimeout = 30_000
                 conn.instanceFollowRedirects = true
                 if (conn.responseCode != HttpURLConnection.HTTP_OK) {
-                    return Result.failure(IllegalStateException("download_http_${conn.responseCode}"))
+                    return@withContext Result.failure(IllegalStateException("download_http_${conn.responseCode}"))
                 }
                 val total = conn.contentLengthLong
                 if (total <= 0 || total > MAX_APK_BYTES) {
-                    return Result.failure(IllegalStateException("download_bad_size"))
+                    return@withContext Result.failure(IllegalStateException("download_bad_size"))
                 }
 
                 var read = 0L
@@ -131,7 +137,7 @@ object UpdateChecker {
                             out.write(buf, 0, n)
                             read += n
                             if (read > MAX_APK_BYTES) {
-                                return Result.failure(IllegalStateException("download_too_large"))
+                                return@withContext Result.failure(IllegalStateException("download_too_large"))
                             }
                             val pct = ((read * 100) / total).toInt()
                             if (pct != lastReported) {
@@ -142,7 +148,7 @@ object UpdateChecker {
                     }
                 }
                 if (read != total) {
-                    return Result.failure(IllegalStateException("download_truncated"))
+                    return@withContext Result.failure(IllegalStateException("download_truncated"))
                 }
             } finally {
                 conn.disconnect()
@@ -150,19 +156,19 @@ object UpdateChecker {
 
             if (!isSignedBySameKey(context, temp)) {
                 temp.delete()
-                return Result.failure(IllegalStateException("signature_mismatch"))
+                return@withContext Result.failure(IllegalStateException("signature_mismatch"))
             }
 
             if (target.exists()) target.delete()
             if (!temp.renameTo(target)) {
                 temp.delete()
-                return Result.failure(IllegalStateException("rename_failed"))
+                return@withContext Result.failure(IllegalStateException("rename_failed"))
             }
             onProgress(100)
             Result.success(target)
         } catch (e: Throwable) {
             temp.delete()
-            Log.d(TAG, "Download failed: ${e.javaClass.simpleName}")
+            Log.d(TAG, "Download failed: ${e.javaClass.simpleName}: ${e.message}")
             Result.failure(e)
         }
     }
