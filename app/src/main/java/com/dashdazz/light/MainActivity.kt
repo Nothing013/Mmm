@@ -61,6 +61,8 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import java.io.File
 import rikka.shizuku.Shizuku
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.extra.*
@@ -167,6 +169,27 @@ class MainActivity : ComponentActivity() {
         shizukuPermissionState.value = LightsBridge.hasShizukuPermission()
         conflictState.value = ConflictDetector.isStockMusicLightActive(this)
         checkRootStatusAsync()
+        resumePendingUpdateInstall()
+        applyPendingNotifMode()
+    }
+
+    private fun applyPendingNotifMode() {
+        val pending = Prefs.getPendingNotifMode(this) ?: return
+        if (!DashDazzNotificationListener.isNotificationAccessGranted(this)) return
+        Prefs.setPendingNotifMode(this, null)
+        DashDazzService.updateSettings(this, notifMode = pending)
+    }
+
+    private fun resumePendingUpdateInstall() {
+        val path = Prefs.getPendingUpdateApk(this) ?: return
+        val file = File(path)
+        if (!file.exists()) {
+            Prefs.setPendingUpdateApk(this, null)
+            return
+        }
+        if (!UpdateChecker.canInstallPackages(this)) return
+        Prefs.setPendingUpdateApk(this, null)
+        runCatching { startActivity(UpdateChecker.installIntent(this, file)) }
     }
 
     @Volatile
@@ -256,21 +279,43 @@ private fun openStripLightSettings(context: Context) {
     }
 }
 
+private fun hueDistance(a: Float, b: Float): Float {
+    val diff = Math.abs(a - b) % 360f
+    return if (diff > 180f) 360f - diff else diff
+}
+
 private fun updateStatusLabel(
     status: UpdateChecker.UpdateStatus,
     progress: Int,
     desc: String,
+    checking: String,
     install: String,
     upToDate: String,
-    failed: String
-): String = when {
-    progress in 0..100 -> "$progress%"
-    else -> when (status) {
+    retry: String,
+    downloadFailed: String,
+    rateLimited: String,
+    assetPending: String,
+    needPermission: String,
+    noInstaller: String
+): String {
+    if (status is UpdateChecker.UpdateStatus.Downloading) {
+        return if (progress in 0..100) "$progress%" else "0%"
+    }
+    if (progress in 0..100) return "$progress%"
+    return when (status) {
         is UpdateChecker.UpdateStatus.Idle -> desc
-        is UpdateChecker.UpdateStatus.Checking -> desc
+        is UpdateChecker.UpdateStatus.Checking -> checking
         is UpdateChecker.UpdateStatus.UpToDate -> upToDate
         is UpdateChecker.UpdateStatus.Available -> install
-        is UpdateChecker.UpdateStatus.Failed -> failed
+        is UpdateChecker.UpdateStatus.Downloading -> checking
+        is UpdateChecker.UpdateStatus.NeedsInstallPermission -> needPermission
+        is UpdateChecker.UpdateStatus.Failed -> when (status.reason) {
+            "download_failed" -> downloadFailed
+            "rate_limited" -> rateLimited
+            "asset_pending" -> assetPending
+            "no_installer" -> noInstaller
+            else -> retry
+        }
     }
 }
 
@@ -537,10 +582,14 @@ fun DashDazzScreen(
     }
 
     var pendingAudioEnable by remember { mutableStateOf(false) }
+    var pendingServiceStart by remember { mutableStateOf(false) }
+    var startRequested by remember { mutableStateOf(false) }
 
     val audioPermissionLauncher = rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
     ) { granted: Boolean ->
+        val wantsStart = pendingServiceStart
+        pendingServiceStart = false
         if (!granted) {
             pendingAudioEnable = false
             Toast.makeText(
@@ -554,7 +603,11 @@ fun DashDazzScreen(
                 DashDazzService.updateSettings(context, audioReactive = true)
             }
 
-            DashDazzService.relaunchAnimation(context)
+            if (wantsStart) {
+                startRequested = true
+            } else {
+                DashDazzService.relaunchAnimation(context)
+            }
         }
     }
 
@@ -570,44 +623,64 @@ fun DashDazzScreen(
     var flashScreen by remember { mutableStateOf(Prefs.isFlashScreen(context)) }
     var autoCharging by remember { mutableStateOf(Prefs.isAutoCharging(context)) }
     val updateScope = rememberCoroutineScope()
-    var updateStatus by remember { mutableStateOf<UpdateChecker.UpdateStatus>(UpdateChecker.UpdateStatus.Idle) }
+    var updateStatusRaw by rememberSaveable {
+        mutableStateOf(UpdateChecker.encode(UpdateChecker.UpdateStatus.Idle))
+    }
+    val updateStatus = remember(updateStatusRaw) { UpdateChecker.decode(updateStatusRaw) }
+    fun setUpdateStatus(s: UpdateChecker.UpdateStatus) {
+        updateStatusRaw = UpdateChecker.encode(s)
+    }
+    var updateDownloading by remember { mutableStateOf(false) }
     var updateProgress by remember { mutableIntStateOf(-1) }
 
     LaunchedEffect(Unit) {
+        if (updateStatus !is UpdateChecker.UpdateStatus.Idle) return@LaunchedEffect
         if (!UpdateChecker.canAutoCheck(context)) return@LaunchedEffect
-        updateStatus = UpdateChecker.UpdateStatus.Checking
-        updateStatus = UpdateChecker.check(context)
+        setUpdateStatus(UpdateChecker.UpdateStatus.Checking)
+        setUpdateStatus(UpdateChecker.check(context))
     }
 
     fun startUpdateCheck() {
-        if (updateProgress >= 0) return
+        if (updateDownloading) return
         updateScope.launch {
-            updateStatus = UpdateChecker.UpdateStatus.Checking
-            updateStatus = UpdateChecker.check(context)
+            setUpdateStatus(UpdateChecker.UpdateStatus.Checking)
+            setUpdateStatus(UpdateChecker.check(context))
         }
     }
 
     fun installUpdate(tag: String) {
+        if (updateDownloading) return
         updateScope.launch {
+            updateDownloading = true
             updateProgress = 0
+            setUpdateStatus(UpdateChecker.UpdateStatus.Downloading(tag, 0))
             val result = UpdateChecker.download(context, tag) { pct ->
                 updateProgress = pct
+                setUpdateStatus(UpdateChecker.UpdateStatus.Downloading(tag, pct))
             }
             updateProgress = -1
+            updateDownloading = false
             val apk = result.getOrNull()
             if (apk == null) {
-                updateStatus = UpdateChecker.UpdateStatus.Failed("download_failed")
+                setUpdateStatus(UpdateChecker.UpdateStatus.Failed("download_failed"))
+                return@launch
+            }
+            if (!UpdateChecker.canInstallPackages(context)) {
+                Prefs.setPendingUpdateApk(context, apk.absolutePath)
+                setUpdateStatus(UpdateChecker.UpdateStatus.NeedsInstallPermission(tag))
+                runCatching {
+                    context.startActivity(UpdateChecker.installPermissionIntent(context))
+                }.onFailure {
+                    Prefs.setPendingUpdateApk(context, null)
+                    setUpdateStatus(UpdateChecker.UpdateStatus.Failed("no_installer"))
+                }
                 return@launch
             }
             val ok = runCatching {
-                if (!UpdateChecker.canInstallPackages(context)) {
-                    context.startActivity(UpdateChecker.installPermissionIntent(context))
-                } else {
-                    context.startActivity(UpdateChecker.installIntent(context, apk))
-                }
+                context.startActivity(UpdateChecker.installIntent(context, apk))
             }.isSuccess
             if (!ok) {
-                updateStatus = UpdateChecker.UpdateStatus.Failed("download_failed")
+                setUpdateStatus(UpdateChecker.UpdateStatus.Failed("no_installer"))
             }
         }
     }
@@ -615,6 +688,23 @@ fun DashDazzScreen(
     fun onUpdateClick() {
         when (val s = updateStatus) {
             is UpdateChecker.UpdateStatus.Available -> installUpdate(s.tag)
+            is UpdateChecker.UpdateStatus.NeedsInstallPermission -> {
+                val path = Prefs.getPendingUpdateApk(context)
+                val apk = path?.let { File(it) }
+                if (apk != null && apk.exists() && UpdateChecker.canInstallPackages(context)) {
+                    val ok = runCatching {
+                        context.startActivity(UpdateChecker.installIntent(context, apk))
+                    }.isSuccess
+                    if (ok) Prefs.setPendingUpdateApk(context, null)
+                    else setUpdateStatus(UpdateChecker.UpdateStatus.Failed("no_installer"))
+                } else if (UpdateChecker.canInstallPackages(context)) {
+                    installUpdate(s.tag)
+                } else {
+                    runCatching {
+                        context.startActivity(UpdateChecker.installPermissionIntent(context))
+                    }
+                }
+            }
             else -> startUpdateCheck()
         }
     }
@@ -689,6 +779,25 @@ fun DashDazzScreen(
         return if (out == -1) 0xFFFEFEFE.toInt() else out
     }
 
+    fun startServiceWithCurrentSettings() {
+            DashDazzService.start(
+                context = context,
+                mode = serviceState.mode,
+                color = getSelectedColor(),
+                speedMs = speedMs,
+                brightness = brightness,
+                screenMode = serviceState.screenMode,
+                blinkOnNotification = serviceState.blinkOnNotification,
+                palette = serviceState.palette,
+                dualStyle = serviceState.dualStyle,
+                splitColorA = serviceState.splitColorA,
+                splitColorB = serviceState.splitColorB,
+                spinColorA = serviceState.spinColorA,
+                spinColorB = serviceState.spinColorB,
+                duoHueOffset = duoHueOffset
+            )
+        }
+
     fun togglePower(checked: Boolean) {
         if (!hasShizukuPermission && !isRootAvailable) {
             onRequestShizukuPermission()
@@ -706,29 +815,22 @@ fun DashDazzScreen(
                         context.getString(R.string.audio_reactive_permission_rationale),
                         Toast.LENGTH_SHORT
                     ).show()
+                    pendingAudioEnable = true
+                    pendingServiceStart = true
                     audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                     return
                 }
             }
-            DashDazzService.start(
-                context = context,
-                mode = serviceState.mode,
-                color = getSelectedColor(),
-                speedMs = speedMs,
-                brightness = brightness,
-                screenMode = serviceState.screenMode,
-                blinkOnNotification = serviceState.blinkOnNotification,
-                palette = serviceState.palette,
-                dualStyle = serviceState.dualStyle,
-                splitColorA = serviceState.splitColorA,
-                splitColorB = serviceState.splitColorB,
-                spinColorA = serviceState.spinColorA,
-                spinColorB = serviceState.spinColorB,
-                duoHueOffset = duoHueOffset
-            )
+            startServiceWithCurrentSettings()
         } else {
             DashDazzService.stop(context)
         }
+    }
+
+    LaunchedEffect(startRequested) {
+        if (!startRequested) return@LaunchedEffect
+        startRequested = false
+        startServiceWithCurrentSettings()
     }
 
     Scaffold(
@@ -1524,8 +1626,8 @@ fun DashDazzScreen(
                                             speedMs = value.toLong()
                                             DashDazzService.updateSettings(context, speedMs = speedMs)
                                         },
-                                        minValue = 1f,
-                                        maxValue = 250f,
+                                        minValue = 10f,
+                                        maxValue = 500f,
                                         modifier = Modifier.fillMaxWidth()
                                     )
                                 }
@@ -1718,7 +1820,7 @@ fun DashDazzScreen(
                                     horizontalArrangement = Arrangement.SpaceEvenly
                                 ) {
                                     standardPresets.forEach { (presetHue, presetSat, color) ->
-                                        val isSelected = Math.abs(hue - presetHue) < 2f && Math.abs(saturation - presetSat) < 0.05f
+                                        val isSelected = hueDistance(hue, presetHue) < 2f && Math.abs(saturation - presetSat) < 0.05f
                                         Box(
                                             modifier = Modifier
                                                 .size(34.dp)
@@ -1801,7 +1903,7 @@ fun DashDazzScreen(
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         customPresets.forEachIndexed { index, (presetHue, presetSat) ->
-                                            val isSelected = Math.abs(hue - presetHue) < 2f && Math.abs(saturation - presetSat) < 0.05f
+                                            val isSelected = hueDistance(hue, presetHue) < 2f && Math.abs(saturation - presetSat) < 0.05f
                                             val presetColorInt = AndroidColor.HSVToColor(floatArrayOf(presetHue, presetSat, 1.0f))
                                             val presetColor = Color(presetColorInt)
                                             Box(
@@ -2226,6 +2328,7 @@ fun DashDazzScreen(
                                                         !DashDazzNotificationListener.isNotificationAccessGranted(context)
                                                     ) {
                                                         DashDazzNotificationListener.openNotificationAccessSettings(context)
+                                                        Prefs.setPendingNotifMode(context, modeVal)
                                                         Toast.makeText(context, R.string.btn_grant_notif_access, Toast.LENGTH_LONG).show()
 
                                                         return@clickable
@@ -2333,10 +2436,18 @@ fun DashDazzScreen(
                             )
                             SuperArrow(
                                 title = stringResource(
-                                    if (isRootAvailable) R.string.root_granted else R.string.root_not_available
+                                    when {
+                                        isRootAvailable -> R.string.root_granted
+                                        !rootChecked -> R.string.root_checking
+                                        else -> R.string.root_not_available
+                                    }
                                 ),
                                 summary = stringResource(
-                                    if (isRootAvailable) R.string.root_granted_desc else R.string.root_not_available_desc
+                                    when {
+                                        isRootAvailable -> R.string.root_granted_desc
+                                        !rootChecked -> R.string.root_checking_desc
+                                        else -> R.string.root_not_available_desc
+                                    }
                                 ),
                                 onClick = onRecheckRoot
                             )
@@ -2421,9 +2532,15 @@ fun DashDazzScreen(
                                     updateStatus,
                                     updateProgress,
                                     stringResource(R.string.update_check_desc),
+                                    stringResource(R.string.update_checking_short),
                                     stringResource(R.string.update_install),
                                     stringResource(R.string.update_up_to_date),
-                                    stringResource(R.string.update_failed)
+                                    stringResource(R.string.update_failed),
+                                    stringResource(R.string.update_download_failed),
+                                    stringResource(R.string.update_rate_limited),
+                                    stringResource(R.string.update_asset_pending),
+                                    stringResource(R.string.update_need_permission),
+                                    stringResource(R.string.update_no_installer)
                                 ),
                                 onClick = { onUpdateClick() }
                             )
@@ -2552,10 +2669,11 @@ fun NotifAppPickerDialog(
                     onCheckedChange = { on ->
                         if (on) {
                             onFilterChange(false)
-                            onChange(emptySet())
                         } else {
                             onFilterChange(true)
-                            onChange(emptySet())
+                            if (allowed.isEmpty()) {
+                                onChange(apps.map { it.packageName }.toSet())
+                            }
                         }
                     }
                 )
@@ -3265,7 +3383,6 @@ fun AudioTuningDialog(    onDismiss: () -> Unit,
                                 context, AudioReactiveEngine.DEFAULT_DEGREES_PER_BEAT
                             )
                             onResetDefaults()
-                            DashDazzService.updateSettings(context, duoHueOffset = 90)
                         }
                         .padding(vertical = 10.dp),
                     contentAlignment = Alignment.Center

@@ -42,6 +42,8 @@ object Prefs {
     private const val KEY_AUDIO_APPS_FILTER = "key_audio_apps_filter"
     private const val KEY_AUTO_CHARGING = "key_auto_charging"
     private const val KEY_UPDATE_LAST_CHECK_MS = "key_update_last_check_ms"
+    private const val KEY_UPDATE_PENDING_APK = "key_update_pending_apk"
+    private const val KEY_PENDING_NOTIF_MODE = "key_pending_notif_mode"
 
     data class AudioConfig(
         val source: Int,
@@ -289,6 +291,22 @@ object Prefs {
 
     fun setUpdateLastCheckMs(context: Context, ms: Long) {
         prefs(context).edit().putLong(KEY_UPDATE_LAST_CHECK_MS, ms).apply()
+    }
+
+    fun getPendingUpdateApk(context: Context): String? =
+        prefs(context).getString(KEY_UPDATE_PENDING_APK, null)
+
+    fun setPendingUpdateApk(context: Context, path: String?) {
+        prefs(context).edit().putString(KEY_UPDATE_PENDING_APK, path).apply()
+    }
+
+    fun getPendingNotifMode(context: Context): Int? {
+        val v = prefs(context).getInt(KEY_PENDING_NOTIF_MODE, -1)
+        return if (v < 0) null else v
+    }
+
+    fun setPendingNotifMode(context: Context, mode: Int?) {
+        prefs(context).edit().putInt(KEY_PENDING_NOTIF_MODE, mode ?: -1).apply()
     }
 
 

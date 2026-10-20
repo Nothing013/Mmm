@@ -172,6 +172,12 @@
     <string name="update_up_to_date">You are on the latest version</string>
     <string name="update_install">Download and install</string>
     <string name="update_failed">Update check failed, tap to retry</string>
+    <string name="update_checking_short">Checking</string>
+    <string name="update_rate_limited">GitHub rate limit reached, try later</string>
+    <string name="update_asset_pending">Release still uploading, try later</string>
+    <string name="update_no_installer">Could not open the installer</string>
+    <string name="update_download_failed">Download failed, tap to retry</string>
+    <string name="update_need_permission">Tap to allow installs, then install</string>
 
     <string name="about_desc">Hardware Camera Ring Controller for POCO X8 Pro Max (Dash) by @ttertekann</string>
     <string name="about_version">v%1$s · build %2$d</string>

@@ -14,6 +14,7 @@ import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import kotlinx.coroutines.CancellationException
 import org.json.JSONObject
 
 object UpdateChecker {
@@ -34,6 +35,41 @@ object UpdateChecker {
         object UpToDate : UpdateStatus
         data class Available(val tag: String, val versionCode: Int) : UpdateStatus
         data class Failed(val reason: String) : UpdateStatus
+        data class Downloading(val tag: String, val percent: Int) : UpdateStatus
+        data class NeedsInstallPermission(val tag: String) : UpdateStatus
+    }
+
+    internal fun encode(status: UpdateStatus): String = when (status) {
+        is UpdateStatus.Idle -> "idle"
+        is UpdateStatus.Checking -> "checking"
+        is UpdateStatus.UpToDate -> "uptodate"
+        is UpdateStatus.Available -> "avail:${status.tag}:${status.versionCode}"
+        is UpdateStatus.Downloading -> "dl:${status.tag}:${status.percent}"
+        is UpdateStatus.NeedsInstallPermission -> "needperm:${status.tag}"
+        is UpdateStatus.Failed -> "failed:${status.reason}"
+    }
+
+    internal fun decode(encoded: String): UpdateStatus {
+        val idx = encoded.indexOf(':')
+        val head = if (idx < 0) encoded else encoded.substring(0, idx)
+        val rest = if (idx < 0) "" else encoded.substring(idx + 1)
+        return when (head) {
+            "checking" -> UpdateStatus.Checking
+            "uptodate" -> UpdateStatus.UpToDate
+            "avail" -> {
+                val parts = rest.split(":")
+                UpdateStatus.Available(parts.getOrElse(0) { "" }, parts.getOrNull(1)?.toIntOrNull() ?: 0)
+            }
+            "dl" -> {
+                val parts = rest.split(":")
+                UpdateStatus.Downloading(
+                    parts.getOrElse(0) { "" }, parts.getOrNull(1)?.toIntOrNull() ?: 0
+                )
+            }
+            "needperm" -> UpdateStatus.NeedsInstallPermission(rest)
+            "failed" -> UpdateStatus.Failed(rest)
+            else -> UpdateStatus.Idle
+        }
     }
 
     fun canAutoCheck(context: Context): Boolean {
@@ -43,7 +79,6 @@ object UpdateChecker {
     }
 
     suspend fun check(context: Context): UpdateStatus = withContext(Dispatchers.IO) {
-        Prefs.setUpdateLastCheckMs(context, System.currentTimeMillis())
         try {
             val conn = URL(API_LATEST).openConnection() as HttpURLConnection
             var status: UpdateStatus
@@ -57,7 +92,7 @@ object UpdateChecker {
                 val code = conn.responseCode
                 status = if (code != HttpURLConnection.HTTP_OK) {
                     val reason = when (code) {
-                        403 -> "rate_limited"
+                        403, 429 -> "rate_limited"
                         404 -> "no_release"
                         else -> "http_$code"
                     }
@@ -65,19 +100,33 @@ object UpdateChecker {
                     UpdateStatus.Failed(reason)
                 } else {
                     val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val tag = JSONObject(body).optString("tag_name")
+                    val json = JSONObject(body)
+                    val tag = json.optString("tag_name")
                     val remote = versionCodeFromTag(tag)
+                    val assetReady = json.optJSONArray("assets")
+                        ?.let { arr ->
+                            (0 until arr.length()).any {
+                                arr.optJSONObject(it)?.optString("name") == ASSET_NAME
+                            }
+                        } ?: false
                     when {
                         remote == null -> UpdateStatus.Failed("bad_tag")
-                        remote > BuildConfig.VERSION_CODE ->
+                        remote > BuildConfig.VERSION_CODE && assetReady ->
                             UpdateStatus.Available(tag, remote)
+                        remote > BuildConfig.VERSION_CODE ->
+                            UpdateStatus.Failed("asset_pending")
                         else -> UpdateStatus.UpToDate
                     }
                 }
             } finally {
                 conn.disconnect()
             }
+            if (status !is UpdateStatus.Failed) {
+                Prefs.setUpdateLastCheckMs(context, System.currentTimeMillis())
+            }
             status
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
             Log.d(TAG, "Update check failed: ${e.javaClass.simpleName}: ${e.message}")
             UpdateStatus.Failed("network")
@@ -166,6 +215,9 @@ object UpdateChecker {
             }
             onProgress(100)
             Result.success(target)
+        } catch (e: CancellationException) {
+            temp.delete()
+            throw e
         } catch (e: Throwable) {
             temp.delete()
             Log.d(TAG, "Download failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -174,29 +226,27 @@ object UpdateChecker {
     }
 
     private fun isSignedBySameKey(context: Context, archive: File): Boolean {
-        val installed = signerDigests(
-            runCatching {
-                context.packageManager
-                    .getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
-                    .signingInfo
-            }.getOrNull()
-        )
-        val candidate = runCatching {
+        val installedInfo = runCatching {
+            context.packageManager
+                .getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+        }.getOrNull() ?: return false
+        val archiveInfo = runCatching {
             context.packageManager.getPackageArchiveInfo(
                 archive.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES
-            )?.signingInfo
-        }.getOrNull()
-        val downloaded = signerDigests(candidate)
-        return !installed.isNullOrEmpty() && installed == downloaded
+            )
+        }.getOrNull() ?: return false
+        if (archiveInfo.packageName != context.packageName) {
+            Log.w(TAG, "Downloaded APK is for ${archiveInfo.packageName}, not ${context.packageName}")
+            return false
+        }
+        val installed = currentSignerDigests(installedInfo.signingInfo) ?: return false
+        val downloaded = currentSignerDigests(archiveInfo.signingInfo) ?: return false
+        return installed.isNotEmpty() && installed == downloaded
     }
 
-    private fun signerDigests(signingInfo: android.content.pm.SigningInfo?): Set<String>? {
+    private fun currentSignerDigests(signingInfo: android.content.pm.SigningInfo?): Set<String>? {
         if (signingInfo == null) return null
-        val signers = if (signingInfo.hasMultipleSigners()) {
-            signingInfo.apkContentsSigners
-        } else {
-            signingInfo.signingCertificateHistory
-        } ?: return null
+        val signers = signingInfo.apkContentsSigners ?: return null
         return runCatching {
             signers.map { cert ->
                 MessageDigest.getInstance("SHA-256").digest(cert.toByteArray())

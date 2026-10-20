@@ -43,4 +43,26 @@ class UpdateCheckerTest {
         assertEquals(true, newer != null && newer > current)
         assertEquals(false, older != null && older > current)
     }
+
+    @Test
+    fun statusRoundTripsThroughEncodeDecode() {
+        val statuses = listOf(
+            UpdateChecker.UpdateStatus.Idle,
+            UpdateChecker.UpdateStatus.Checking,
+            UpdateChecker.UpdateStatus.UpToDate,
+            UpdateChecker.UpdateStatus.Available("v2.0.81", 81),
+            UpdateChecker.UpdateStatus.Downloading("v2.0.81", 42),
+            UpdateChecker.UpdateStatus.NeedsInstallPermission("v2.0.81"),
+            UpdateChecker.UpdateStatus.Failed("rate_limited")
+        )
+        for (s in statuses) {
+            assertEquals(s, UpdateChecker.decode(UpdateChecker.encode(s)))
+        }
+    }
+
+    @Test
+    fun decodeFallsBackToIdleForGarbage() {
+        assertEquals(UpdateChecker.UpdateStatus.Idle, UpdateChecker.decode("garbage"))
+        assertEquals(UpdateChecker.UpdateStatus.Idle, UpdateChecker.decode(""))
+    }
 }
