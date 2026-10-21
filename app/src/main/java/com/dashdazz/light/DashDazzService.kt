@@ -446,8 +446,22 @@ class DashDazzService : Service() {
         private fun flashScreenEvent(context: Context) {
             val svc = activeService
             if (svc != null && _stateFlow.value.isRunning) {
+                val isNotifOnly = _stateFlow.value.screenMode == SCREEN_NOTIF_ONLY
+                val audioReactive = _stateFlow.value.audioReactive
                 svc.handleNotificationPulse(Prefs.getColor(context)) {
-                    svc.evaluateScreenPolicy()
+                    if (isNotifOnly && audioReactive) {
+                        // Resume audio-reactive loop after flash
+                        svc.evaluateScreenPolicy()
+                    } else if (isNotifOnly) {
+                        // Pure Notification Only: turn off and return to idle state cleanly
+                        LightsBridge.turnOff()
+                        _stateFlow.update { it.copy(isRunning = true, isScreenPaused = true) }
+                        svc.updateNotificationText()
+                        notifyTileState(context)
+                    } else {
+                        // All other modes: re-apply screen policy
+                        svc.evaluateScreenPolicy()
+                    }
                 }
                 return
             }
