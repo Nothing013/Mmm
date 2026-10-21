@@ -152,7 +152,9 @@ class DashDazzService : Service() {
             screenInteractiveFlag = interactive
             val svc = activeService
             val isFlashing = Prefs.isFlashScreen(context)
-            if (isFlashing) {
+            val audioReactive = _stateFlow.value.audioReactive
+            // Flash on lock/unlock is suppressed when React to Audio is enabled
+            if (isFlashing && !audioReactive) {
                 Log.d(TAG, "Flash on ${if (interactive) "unlock" else "lock"} firing")
                 flashScreenEvent(context)
             } else {
