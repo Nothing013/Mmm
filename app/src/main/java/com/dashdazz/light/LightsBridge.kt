@@ -259,7 +259,20 @@ object LightsBridge {
 
 
 
+    @Volatile
+    private var hardwareInitialized = false
+
+    fun ensureHardwareReady(): Boolean {
+        var rootOk = true
+        if (isRootAvailable()) {
+            rootOk = resetHardwareToGlobal()
+        }
+        val shizukuOk = resetScene()
+        return rootOk || shizukuOk
+    }
+
     fun hardwareOff(): Boolean = synchronized(hwLock) {
+        hardwareInitialized = false
         trackPushed(0xFF000000.toInt())
         runRoot(
             "SYS=\"$SYS_REG\"; " +
@@ -282,7 +295,9 @@ object LightsBridge {
                     "echo '0xa1 0x00' > \"\$SYS\" && " +
                     "echo '0xa7 0xcc' > \"\$SYS\" && " +
                     "echo '0xab 0xff' > \"\$SYS\""
-            return runRoot(cmd)
+            val ok = runRoot(cmd)
+            if (ok) hardwareInitialized = true
+            return ok
         }
     }
 
@@ -304,6 +319,9 @@ object LightsBridge {
     private fun hex(v: Int): String = String.format(java.util.Locale.ROOT, "0x%02x", v.coerceIn(0, 255))
 
     fun setHardwareColorDirect(colorArgb: Int): Boolean = synchronized(hwLock) {
+        if (!hardwareInitialized) {
+            resetHardwareToGlobal()
+        }
         val c = sanitized(colorArgb)
         val r = (c shr 16) and 0xFF
         val g = (c shr 8) and 0xFF

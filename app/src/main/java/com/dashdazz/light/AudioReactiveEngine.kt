@@ -804,7 +804,8 @@ object AudioReactiveEngine {
         }
         val driving = DashDazzService.isRunning &&
             DashDazzService.stateFlow.value.audioReactive &&
-            !DashDazzService.stateFlow.value.isScreenPaused
+            (!DashDazzService.stateFlow.value.isScreenPaused ||
+             DashDazzService.stateFlow.value.screenMode == DashDazzService.SCREEN_NOTIF_ONLY)
         if (driving && !running) restart()
     }
 

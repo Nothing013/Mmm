@@ -29,10 +29,39 @@ class DashDazzNotificationListener : NotificationListenerService() {
     @Volatile
     private var mediaReclaimJob: kotlinx.coroutines.Job? = null
 
+    @Volatile
+    private var activeControllers: List<MediaController> = emptyList()
+
+    private val controllerCallback = object : MediaController.Callback() {
+        override fun onPlaybackStateChanged(state: PlaybackState?) {
+            val sessions = getSystemService(MediaSessionManager::class.java)
+                ?.getActiveSessions(ComponentName(this@DashDazzNotificationListener, DashDazzNotificationListener::class.java))
+            handleMediaSessionChange(sessions ?: activeControllers)
+        }
+    }
+
     private val mediaSessionListener = object : MediaSessionManager.OnActiveSessionsChangedListener {
         override fun onActiveSessionsChanged(controllers: List<MediaController>?) {
+            updateControllerCallbacks(controllers)
             handleMediaSessionChange(controllers)
         }
+    }
+
+    private fun updateControllerCallbacks(newControllers: List<MediaController>?) {
+        for (ctrl in activeControllers) {
+            try {
+                ctrl.unregisterCallback(controllerCallback)
+            } catch (_: Throwable) {
+            }
+        }
+        val next = newControllers ?: emptyList()
+        for (ctrl in next) {
+            try {
+                ctrl.registerCallback(controllerCallback)
+            } catch (_: Throwable) {
+            }
+        }
+        activeControllers = next
     }
 
     @Volatile
@@ -70,6 +99,7 @@ class DashDazzNotificationListener : NotificationListenerService() {
         val playingNow = playingPackagesOf(controllers)
         val anyPlaying = playingNow.isNotEmpty()
         publishPlayingPackages(playingNow)
+        DashDazzService.onMediaPlaybackChanged(anyPlaying)
 
         if (anyPlaying && !mediaWasPlaying) {
             Log.d(TAG, "Media playback started: scheduling scene reclaims")
@@ -86,6 +116,7 @@ class DashDazzNotificationListener : NotificationListenerService() {
                     }
                     val stillPlaying = stillPlayingPkgs.isNotEmpty()
                     publishPlayingPackages(stillPlayingPkgs)
+                    DashDazzService.onMediaPlaybackChanged(stillPlaying)
                     if (!stillPlaying) break
                     if (DashDazzService.isRunning && !DashDazzService.stateFlow.value.isScreenPaused) {
                         LightsBridge.resetScene()
@@ -114,7 +145,9 @@ class DashDazzNotificationListener : NotificationListenerService() {
                 sessionListenerRegistered = msm != null
             }
 
-            handleMediaSessionChange(msm?.getActiveSessions(component))
+            val initialSessions = msm?.getActiveSessions(component)
+            updateControllerCallbacks(initialSessions)
+            handleMediaSessionChange(initialSessions)
         } catch (e: SecurityException) {
             Log.w(TAG, "Cannot access MediaSessionManager — notification listener permission may be insufficient", e)
         } catch (e: Throwable) {
@@ -124,10 +157,12 @@ class DashDazzNotificationListener : NotificationListenerService() {
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
+        updateControllerCallbacks(null)
         mediaReclaimJob?.cancel()
         mediaReclaimJob = null
         mediaWasPlaying = false
         publishPlayingPackages(emptySet())
+        DashDazzService.onMediaPlaybackChanged(false)
         try {
             requestRebind(ComponentName(this, DashDazzNotificationListener::class.java))
         } catch (e: Throwable) {
@@ -181,6 +216,7 @@ class DashDazzNotificationListener : NotificationListenerService() {
     }
 
     override fun onDestroy() {
+        updateControllerCallbacks(null)
         try {
             val msm = getSystemService(MediaSessionManager::class.java)
             msm?.removeOnActiveSessionsChangedListener(mediaSessionListener)
@@ -191,6 +227,7 @@ class DashDazzNotificationListener : NotificationListenerService() {
         mediaReclaimJob = null
         mediaWasPlaying = false
         publishPlayingPackages(emptySet())
+        DashDazzService.onMediaPlaybackChanged(false)
         listenerScope.cancel()
         super.onDestroy()
     }

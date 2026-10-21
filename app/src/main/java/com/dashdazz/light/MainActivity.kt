@@ -2196,7 +2196,10 @@ fun DashDazzScreen(
                                                 )
                                             }
                                             .clickable {
-                                                DashDazzService.updateSettings(context, screenMode = modeVal)
+                                                val newNotif = if (modeVal == DashDazzService.SCREEN_NOTIF_ONLY && serviceState.notifMode == Prefs.NOTIF_MODE_OFF) {
+                                                    Prefs.NOTIF_MODE_ACTIVATE
+                                                } else null
+                                                DashDazzService.updateSettings(context, screenMode = modeVal, notifMode = newNotif)
                                             }
                                             .padding(vertical = 12.dp, horizontal = 4.dp),
                                         contentAlignment = Alignment.Center
